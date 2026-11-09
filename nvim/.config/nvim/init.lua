@@ -242,6 +242,7 @@ end
 ---@type vim.Option
 local rtp = vim.opt.rtp
 rtp:prepend(lazypath)
+rtp:append(vim.fn.stdpath 'data' .. '/site') -- treesitter installs parsers here
 
 -- [[ Configure and install plugins ]]
 --
@@ -320,6 +321,9 @@ require('lazy').setup({
         { '<leader>t', group = '[T]oggle' },
         { '<leader>h', group = 'Git [H]unk', mode = { 'n', 'v' } }, -- Enable gitsigns recommended keymaps first
         { 'gr', group = 'LSP Actions', mode = { 'n' } },
+        { '<leader>n', group = '.[N]ET' },
+        { '<leader>ne', group = '[E]F Core' },
+        { '<leader>D', group = '[D]ebug' },
       },
     },
   },
@@ -384,6 +388,23 @@ require('lazy').setup({
 
       -- [[ Configure Telescope ]]
       -- See `:help telescope` and `:help telescope.setup()`
+      local ignore_filetypes_list = {
+        -- Version control
+        "%.git/",
+        -- Python
+        "%.venv/",
+        "__pycache__/",
+        "%.pyc$",
+        -- TypeScript / JavaScript
+        "node_modules/",
+        "dist/",
+        -- .NET
+        "bin/",
+        "obj/",
+        -- macOS
+        "%.DS_Store$",
+      }
+
       require('telescope').setup {
         -- You can put your default mappings / updates / etc. in here
         --  All the info you're looking for is in `:help telescope.setup()`
@@ -393,7 +414,21 @@ require('lazy').setup({
         --     i = { ['<c-enter>'] = 'to_fuzzy_refine' },
         --   },
         -- },
-        -- pickers = {}
+        defaults = {
+          file_ignore_patterns = ignore_filetypes_list,
+        },
+        pickers = {
+          find_files = {
+            hidden = true,
+            -- Also surface files that are listed in .gitignore (e.g. .env, .env.local, .env.dev).
+            -- The file_ignore_patterns above still filter out noise like node_modules and .git.
+            no_ignore = true,
+          },
+          live_grep = {
+            -- Pass the same flags through to ripgrep so grep-search also hits gitignored files.
+            additional_args = { "--hidden", "--no-ignore" },
+          },
+        },
         extensions = {
           ['ui-select'] = { require('telescope.themes').get_dropdown() },
         },
@@ -609,7 +644,7 @@ require('lazy').setup({
         --    https://github.com/pmizio/typescript-tools.nvim
         --
         -- But for many setups, the LSP (`ts_ls`) will work just fine
-        -- ts_ls = {},
+        ts_ls = {},
 
         stylua = {}, -- Used to format Lua code
 
@@ -823,7 +858,7 @@ require('lazy').setup({
       -- Load the colorscheme here.
       -- Like many other themes, this one has different styles, and you could load
       -- any other, such as 'tokyonight-storm', 'tokyonight-moon', or 'tokyonight-day'.
-      vim.cmd.colorscheme 'tokyonight-night'
+      vim.cmd.colorscheme 'catppuccin'
     end,
   },
 
@@ -888,9 +923,15 @@ require('lazy').setup({
     branch = 'main',
     -- [[ Configure Treesitter ]] See `:help nvim-treesitter-intro`
     config = function()
-      -- ensure basic parser are installed
-      local parsers = { 'bash', 'c', 'diff', 'html', 'lua', 'luadoc', 'markdown', 'markdown_inline', 'query', 'vim', 'vimdoc' }
-      require('nvim-treesitter').install(parsers)
+      -- only install parsers that aren't already present
+      local parsers = { 'bash', 'c', 'c_sharp', 'diff', 'html', 'json', 'lua', 'luadoc', 'markdown', 'markdown_inline', 'query', 'vim', 'vimdoc', 'xml' }
+      local installed = require('nvim-treesitter').get_installed 'parsers'
+      local to_install = vim.tbl_filter(function(p)
+        return not vim.tbl_contains(installed, p)
+      end, parsers)
+      if #to_install > 0 then
+        require('nvim-treesitter').install(to_install)
+      end
 
       ---@param buf integer
       ---@param language string
@@ -958,7 +999,7 @@ require('lazy').setup({
   --    This is the easiest way to modularize your config.
   --
   --  Uncomment the following line and add your plugins to `lua/custom/plugins/*.lua` to get going.
-  -- { import = 'custom.plugins' },
+  { import = 'custom.plugins' },
   --
   -- For additional information with loading, sourcing and examples see `:help lazy.nvim-🔌-plugin-spec`
   -- Or use telescope!

@@ -1,0 +1,3 @@
+# agent-repo-guard: every repo directly under these folders is protected.
+# One folder per line. ~ is expanded. Lines after # are ignored.
+~/work/imas

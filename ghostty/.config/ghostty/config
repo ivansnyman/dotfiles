@@ -11,3 +11,9 @@ window-save-state = always
 macos-titlebar-style = transparent
 background-opacity = 0.65
 background-blur = 90
+
+# Split pane navigation (vim-style)
+keybind = super+ctrl+h=goto_split:left
+keybind = super+ctrl+l=goto_split:right
+keybind = super+ctrl+k=goto_split:up
+keybind = super+ctrl+j=goto_split:down

@@ -1,0 +1,424 @@
+#!/usr/bin/python3
+"""agent-repo-guard: PreToolUse hook shared by Claude Code and Codex.
+
+Inside protected repos (every directory under a root listed in
+~/.config/agent-repo-guard/protected-roots) it:
+
+  * allows read-only git only (status, diff, log, show, blame, ...)
+  * asks before merge simulations in worktrees
+    (git worktree add/remove/..., git merge --no-commit --no-ff, git merge --abort)
+  * blocks every other git command (commit, push, pull, fetch, merge, checkout, ...)
+  * blocks alembic and migration runners (alembic, python -m alembic,
+    python -m <pkg> migrate, migrate.py, startup.sh)
+  * blocks proto generation (protoc*, buf, python -m grpc_tools.protoc)
+  * blocks creating or changing agent files inside the repo
+    (CLAUDE.md, CLAUDE.local.md, AGENTS.md, AGENTS.override.md, .claude/, .codex/)
+
+Everything else (reading and editing normal repo files) passes through to the
+tool's normal permission flow.
+
+Usage (hook command):  agent-repo-guard --agent claude|codex
+Input: hook JSON on stdin.  Output: a PreToolUse decision JSON on stdout, or
+nothing (no opinion).  Codex has no "ask" for PreToolUse, so "ask" becomes
+"deny" there with a note to get the human to run it.
+
+This is a guardrail, not a sandbox: a determined script (make targets, a
+Python file that imports alembic, ...) can still get around it.
+"""
+
+import json
+import os
+import re
+import shlex
+import sys
+
+CONFIG = os.path.expanduser("~/.config/agent-repo-guard/protected-roots")
+
+# ---------------------------------------------------------------- git policy
+
+GIT_READ_ONLY = {
+    "status", "diff", "log", "show", "blame", "annotate", "shortlog",
+    "describe", "rev-parse", "rev-list", "ls-files", "ls-tree", "ls-remote",
+    "cat-file", "grep", "show-ref", "show-branch", "name-rev", "merge-base",
+    "merge-tree", "diff-tree", "diff-files", "diff-index", "for-each-ref",
+    "count-objects", "check-ignore", "check-attr", "check-ref-format", "var",
+    "help", "version", "whatchanged", "range-diff", "cherry", "difftool",
+}
+# git global options that take a separate value
+GIT_GLOBAL_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace",
+                         "--super-prefix", "--config-env", "--exec-path"}
+
+BRANCH_WRITE_FLAGS = {"-d", "-D", "--delete", "-m", "-M", "--move", "-c", "-C",
+                      "--copy", "-f", "--force", "-u", "--set-upstream-to",
+                      "--unset-upstream", "--edit-description", "-t", "--track",
+                      "--no-track", "--create-reflog"}
+BRANCH_VALUE_FLAGS = {"--contains", "--no-contains", "--merged", "--no-merged",
+                      "--points-at", "--sort", "--format", "--column"}
+
+AGENT_FILE_NAMES = {"CLAUDE.md", "CLAUDE.local.md", "AGENTS.md", "AGENTS.override.md"}
+AGENT_DIR_NAMES = {".claude", ".codex"}
+
+# Bash programs whose positional arguments are write targets
+WRITE_PROGRAMS = {"touch", "mkdir", "cp", "mv", "tee", "ln", "install", "rsync",
+                  "truncate", "dd"}
+
+WRAPPERS = {"command", "builtin", "exec", "nohup", "time", "sudo", "nice", "caffeinate"}
+RUNNERS = {  # program -> subcommand that means "run the following command"
+    "uv": "run", "poetry": "run", "pipenv": "run", "pdm": "run", "pipx": "run",
+    "hatch": "run", "rye": "run",
+}
+
+
+class Decision(Exception):
+    def __init__(self, kind, reason):
+        super().__init__(reason)
+        self.kind = kind  # "deny" or "ask"
+        self.reason = reason
+
+
+def deny(reason):
+    raise Decision("deny", reason)
+
+
+def ask(reason):
+    raise Decision("ask", reason)
+
+
+# ------------------------------------------------------------ scope helpers
+
+def protected_roots():
+    roots = []
+    try:
+        with open(CONFIG) as fh:
+            for line in fh:
+                line = line.split("#", 1)[0].strip()
+                if line:
+                    roots.append(os.path.realpath(os.path.expanduser(line)))
+    except OSError:
+        pass
+    return roots
+
+
+def repo_rel(path, roots):
+    """If path is inside <root>/<repo>/..., return the path relative to <repo>
+    ("" for the repo dir itself). Otherwise None."""
+    real = os.path.realpath(path)
+    for root in roots:
+        if real.startswith(root + os.sep):
+            parts = os.path.relpath(real, root).split(os.sep)
+            return os.sep.join(parts[1:])
+    return None
+
+
+def resolve(token, cwd):
+    return os.path.normpath(os.path.join(cwd, os.path.expanduser(token)))
+
+
+def is_agent_file(rel):
+    if rel is None or rel == "":
+        return False
+    parts = rel.split(os.sep)
+    return parts[-1] in AGENT_FILE_NAMES or any(p in AGENT_DIR_NAMES for p in parts)
+
+
+def check_file_target(path, cwd, roots):
+    rel = repo_rel(resolve(path, cwd), roots)
+    if is_agent_file(rel):
+        deny(f"Creating or changing agent files (CLAUDE.md, AGENTS.md, .claude/, .codex/) "
+             f"inside protected repos is not allowed: {rel}")
+
+
+# --------------------------------------------------------- shell tokenizing
+
+def split_commands(command):
+    """Split a shell string into simple commands (lists of words)."""
+    # newlines and backticks start new commands; operators are split by shlex
+    text = command.replace("`", " ; ").replace("\n", " ; ")
+    lex = shlex.shlex(text, posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    commands, current, redirect_next = [], [], False
+    redirect_targets = []
+    for tok in lex:
+        if tok and set(tok) <= set("();<>|&"):
+            if ">" in tok:
+                redirect_next = True
+                continue
+            if current:
+                commands.append(current)
+            current = []
+            continue
+        if redirect_next:
+            redirect_targets.append(tok)
+            redirect_next = False
+            continue
+        if tok == "$":  # from "$(" -- the "(" ends the command
+            continue
+        current.append(tok)
+    if current:
+        commands.append(current)
+    return commands, redirect_targets
+
+
+def strip_prefixes(words):
+    """Drop env assignments, wrappers and runners in front of the program."""
+    i = 0
+    while i < len(words):
+        w = words[i]
+        base = os.path.basename(w)
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w):
+            i += 1
+        elif base == "env":
+            i += 1
+            while i < len(words) and (words[i].startswith("-") or "=" in words[i]):
+                i += 1
+        elif base in WRAPPERS:
+            i += 1
+            while i < len(words) and words[i].startswith("-"):
+                i += 1
+        elif base == "timeout":
+            i += 1
+            while i < len(words) and words[i].startswith("-"):
+                i += 1
+            i += 1  # duration
+        elif base == "xargs":
+            i += 1
+            while i < len(words) and words[i].startswith("-"):
+                i += 1
+        elif base in RUNNERS and i + 1 < len(words) and words[i + 1] == RUNNERS[base]:
+            i += 2
+            while i < len(words) and words[i].startswith("-"):
+                i += 1
+        elif base in ("bunx", "npx", "uvx"):
+            i += 1
+            while i < len(words) and words[i].startswith("-"):
+                i += 1
+        else:
+            break
+    return words[i:]
+
+
+# --------------------------------------------------------------- checkers
+
+def check_git(args):
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        opt = args[i]
+        i += 2 if opt in GIT_GLOBAL_WITH_VALUE else 1
+    if i >= len(args):
+        return  # bare "git" or "git --version"
+    sub, rest = args[i], args[i + 1:]
+    flags = [a for a in rest if a.startswith("-")]
+
+    if sub in GIT_READ_ONLY:
+        return
+    if sub == "branch":
+        if any(f.split("=", 1)[0] in BRANCH_WRITE_FLAGS for f in flags):
+            deny("git branch with create/delete/rename flags is blocked (read-only git).")
+        listing = "--list" in rest or "-l" in rest
+        positional, j = [], 0
+        while j < len(rest):
+            a = rest[j]
+            if a in BRANCH_VALUE_FLAGS:
+                j += 2
+                continue
+            if not a.startswith("-"):
+                positional.append(a)
+            j += 1
+        if positional and not listing:
+            deny("Creating branches is blocked (read-only git). Listing branches is fine.")
+        return
+    if sub == "tag":
+        if rest and not ("-l" in rest or "--list" in rest) and not all(a.startswith("-n") for a in rest):
+            deny("Creating or deleting tags is blocked (read-only git). Use git tag -l to list.")
+        return
+    if sub == "remote":
+        if not rest or rest[0] in ("-v", "--verbose", "show", "get-url"):
+            return
+        deny("Changing git remotes is blocked (read-only git).")
+    if sub == "stash":
+        if rest and rest[0] in ("list", "show"):
+            return
+        deny("git stash (other than list/show) changes the working tree and is blocked.")
+    if sub == "config":
+        read_flags = {"--get", "--get-all", "--get-regexp", "--list", "-l",
+                      "--show-origin", "--show-scope", "--get-urlmatch"}
+        if any(a.split("=", 1)[0] in read_flags for a in rest) or (rest and rest[0] in ("get", "list")):
+            return
+        deny("Writing git config is blocked (read-only git).")
+    if sub == "reflog":
+        if not rest or rest[0] == "show" or rest[0].startswith("-"):
+            return
+        deny("git reflog expire/delete is blocked.")
+    if sub == "worktree":
+        if rest and rest[0] == "list":
+            return
+        ask("git worktree " + " ".join(rest[:1]) +
+            ": allowed only for merge simulations, and needs your approval.")
+    if sub == "merge":
+        if "--abort" in rest or "--quit" in rest:
+            ask("git merge --abort: ending a merge simulation needs your approval.")
+        if "--no-commit" in rest and "--no-ff" in rest:
+            ask("git merge --no-commit --no-ff: merge simulation (should run in a worktree) "
+                "needs your approval.")
+        deny("git merge is blocked. To simulate a merge, use a worktree with "
+             "git merge --no-commit --no-ff (asks for approval), or git merge-tree.")
+    deny(f"git {sub} is blocked in this repo: only read-only git is allowed "
+         f"(status, diff, log, show, blame, branch listing, ...).")
+
+
+def check_python(args):
+    j = 0
+    while j < len(args):
+        a = args[j]
+        if a == "-m" and j + 1 < len(args):
+            module, rest = args[j + 1], args[j + 2:]
+            if module == "alembic" or module.startswith("alembic."):
+                deny("Running alembic is blocked in this repo.")
+            if module.startswith("grpc_tools") or module.startswith("betterproto"):
+                deny("Running proto/protobuf generation is blocked in this repo.")
+            if module.endswith(".migrate") or "migrate" in rest:
+                deny("Running database migrations is blocked in this repo.")
+            return
+        if a == "-c" and j + 1 < len(args):
+            code = args[j + 1]
+            if re.search(r"\balembic\b", code):
+                deny("Running alembic from inline Python is blocked in this repo.")
+            if re.search(r"grpc_tools|protoc", code):
+                deny("Running proto generation from inline Python is blocked in this repo.")
+            return
+        if not a.startswith("-"):
+            name = os.path.basename(a)
+            if name in ("migrate.py", "alembic"):
+                deny("Running database migrations is blocked in this repo.")
+            return
+        j += 1
+
+
+def check_simple(words, cwd, roots, depth):
+    words = strip_prefixes(words)
+    if not words:
+        return
+    prog, args = words[0], words[1:]
+    base = os.path.basename(prog)
+
+    if base in ("bash", "sh", "zsh", "dash") and "-c" in args:
+        idx = args.index("-c")
+        if idx + 1 < len(args):
+            check_bash(args[idx + 1], cwd, roots, depth + 1)
+        return
+    if base == "eval":
+        check_bash(" ".join(args), cwd, roots, depth + 1)
+        return
+    if base in ("bash", "sh", "zsh") and args and os.path.basename(args[0]) == "startup.sh":
+        deny("startup.sh runs database migrations and is blocked in this repo.")
+    if base == "startup.sh":
+        deny("startup.sh runs database migrations and is blocked in this repo.")
+
+    if base == "git":
+        check_git(args)
+    elif base == "alembic":
+        deny("Running alembic is blocked in this repo.")
+    elif base.startswith("protoc") or base == "buf":
+        deny("Running proto/protobuf generation is blocked in this repo.")
+    elif re.match(r"^python(\d+(\.\d+)?)?$", base):
+        check_python(args)
+
+    if base in WRITE_PROGRAMS or (base == "sed" and any(a.startswith("-i") for a in args)):
+        for a in args:
+            if not a.startswith("-"):
+                check_file_target(a, cwd, roots)
+
+
+def check_bash(command, cwd, roots, depth=0):
+    if depth > 3:
+        deny("Command nests shells too deeply for the repo guard to check.")
+    try:
+        commands, redirect_targets = split_commands(command)
+    except ValueError:
+        if re.search(r"\b(git|alembic|protoc|buf|grpc_tools)\b|CLAUDE\.md|AGENTS\.md|\.claude|\.codex",
+                     command):
+            deny("The repo guard could not parse this command (unbalanced quotes?). "
+                 "Rewrite it as a simpler command.")
+        return
+    for target in redirect_targets:
+        check_file_target(target, cwd, roots)
+    for words in commands:
+        check_simple(words, cwd, roots, depth)
+
+
+def touches_protected(command, cwd, roots):
+    """True when the command names a path inside a protected repo."""
+    for tok in re.findall(r"[~/.\w-][^\s'\";|&()<>]*", command):
+        if "/" in tok or tok.startswith("~"):
+            if repo_rel(resolve(tok, cwd), roots) is not None:
+                return True
+    return False
+
+
+def patch_paths(patch):
+    return re.findall(r"^\*\*\* (?:Add|Update|Delete) File: (.+?)\s*$|^\*\*\* Move to: (.+?)\s*$",
+                      patch, flags=re.M)
+
+
+# ------------------------------------------------------------------- main
+
+def evaluate(data, roots):
+    cwd = data.get("cwd") or os.getcwd()
+    tool = data.get("tool_name", "")
+    tin = data.get("tool_input") or {}
+
+    if tool == "Bash":
+        command = tin.get("command") or ""
+        if isinstance(command, list):
+            command = " ".join(shlex.quote(c) for c in command)
+        if repo_rel(cwd, roots) is None and not touches_protected(command, cwd, roots):
+            return
+        check_bash(command, cwd, roots)
+    elif tool in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+        path = tin.get("file_path") or tin.get("notebook_path")
+        if path:
+            check_file_target(path, cwd, roots)
+    elif tool in ("apply_patch",):
+        patch = tin.get("command") or tin.get("patch") or tin.get("input") or ""
+        if isinstance(patch, list):
+            patch = "\n".join(patch)
+        for add_upd, move in patch_paths(patch):
+            check_file_target(add_upd or move, cwd, roots)
+
+
+def emit(kind, reason, agent):
+    if agent == "codex" and kind == "ask":
+        kind = "deny"
+        reason += (" Codex cannot ask for approval from a hook, so this is blocked here. "
+                   "Ask the user to run it, or use Claude Code.")
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": kind,
+        "permissionDecisionReason": "[agent-repo-guard] " + reason,
+    }}))
+
+
+def main():
+    agent = "claude"
+    if "--agent" in sys.argv:
+        idx = sys.argv.index("--agent")
+        if idx + 1 < len(sys.argv):
+            agent = sys.argv[idx + 1]
+    try:
+        data = json.load(sys.stdin)
+    except ValueError:
+        return 0
+    roots = protected_roots()
+    if not roots:
+        return 0
+    try:
+        evaluate(data, roots)
+    except Decision as d:
+        emit(d.kind, d.reason, agent)
+    except Exception as exc:  # fail closed, but only for calls that reached the checks
+        emit("deny", f"Guard error ({type(exc).__name__}: {exc}); blocked to be safe.", agent)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
